@@ -13,6 +13,7 @@ import distr.cli.commands.SetReplicationDelayCommand;
 import distr.cli.commands.SetRfCommand;
 import distr.cli.commands.SetSemiSyncAcksCommand;
 import distr.cli.commands.DeleteCommand;
+import distr.cli.commands.ReplCommand;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -36,7 +37,8 @@ import java.nio.file.Path;
                 GetCommand.class,
                 DumpCommand.class,
                 DeleteCommand.class,
-                BenchCommand.class
+                BenchCommand.class,
+                ReplCommand.class
         }
 )
 public final class CliMain implements Runnable {
@@ -63,4 +65,3 @@ public final class CliMain implements Runnable {
         }
     }
 }
-
