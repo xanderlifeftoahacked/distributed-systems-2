@@ -10,7 +10,7 @@ public final class NodeContext {
     private final int port;
     private final ClusterState clusterState;
     private final NodeStore store;
-    private final AtomicLong seq;
+    private final AtomicLong lamport;
     private final ReplicationManager replicationManager;
 
     public NodeContext(String nodeId, String host, int port) {
@@ -19,7 +19,7 @@ public final class NodeContext {
         this.port = port;
         this.clusterState = new ClusterState();
         this.store = new NodeStore();
-        this.seq = new AtomicLong(0L);
+        this.lamport = new AtomicLong(0L);
         this.replicationManager = new ReplicationManager(this);
     }
 
@@ -43,8 +43,18 @@ public final class NodeContext {
         return store;
     }
 
-    public long nextSeq() {
-        return seq.incrementAndGet();
+    public long nextLamport() {
+        return lamport.incrementAndGet();
+    }
+
+    public long observeLamport(long remote) {
+        while (true) {
+            long current = lamport.get();
+            long next = Math.max(current, remote) + 1;
+            if (lamport.compareAndSet(current, next)) {
+                return next;
+            }
+        }
     }
 
     public ReplicationManager replicationManager() {

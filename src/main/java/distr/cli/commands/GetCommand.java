@@ -56,11 +56,11 @@ public final class GetCommand extends BaseCommand {
             return state.getNode(targetNodeId).orElse(null);
         }
         if ("leader".equalsIgnoreCase(readMode)) {
-            String leaderId = state.getLeaderNodeId();
-            if (leaderId == null) {
-                return null;
+            List<NodeInfo> leaders = state.getWriteLeaders();
+            if (!leaders.isEmpty()) {
+                return leaders.get(0);
             }
-            return state.getNode(leaderId).orElse(null);
+            return null;
         }
         List<NodeInfo> nodes = new ArrayList<>(state.getNodes().values());
         if (nodes.isEmpty()) {

@@ -12,7 +12,8 @@ public final class ListNodesCommand extends BaseCommand {
         CliState state = loadState();
         for (NodeInfo node : state.getNodes().values()) {
             String leaderMarker = node.nodeId().equals(state.getLeaderNodeId()) ? "*" : "";
-            System.out.println(node.nodeId() + " " + node.host() + ":" + node.port() + leaderMarker);
+            String role = node.role() == null ? "follower" : node.role().toWire();
+            System.out.println(node.nodeId() + " " + node.host() + ":" + node.port() + " " + role + leaderMarker);
         }
     }
 }

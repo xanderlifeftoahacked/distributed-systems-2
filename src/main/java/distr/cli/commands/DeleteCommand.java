@@ -28,12 +28,7 @@ public final class DeleteCommand extends BaseCommand {
     @Override
     public void run() {
         CliState state = loadState();
-        String target = targetNodeId != null ? targetNodeId : state.getLeaderNodeId();
-        if (target == null) {
-            System.err.println("UNKNOWN_NODE");
-            return;
-        }
-        NodeInfo node = state.getNode(target).orElse(null);
+        NodeInfo node = resolveTarget(state);
         if (node == null) {
             System.err.println("UNKNOWN_NODE");
             return;
@@ -49,6 +44,17 @@ public final class DeleteCommand extends BaseCommand {
         } catch (IOException e) {
             System.err.println("TIMEOUT");
         }
+    }
+
+    private NodeInfo resolveTarget(CliState state) {
+        if (targetNodeId != null) {
+            return state.getNode(targetNodeId).orElse(null);
+        }
+        java.util.List<NodeInfo> leaders = state.getWriteLeaders();
+        if (!leaders.isEmpty()) {
+            return leaders.get(0);
+        }
+        return null;
     }
 }
 

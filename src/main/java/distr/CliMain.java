@@ -2,16 +2,22 @@ package distr;
 
 import distr.cli.commands.AddNodeCommand;
 import distr.cli.commands.BenchCommand;
+import distr.cli.commands.ClusterDumpCommand;
+import distr.cli.commands.DemoteLeaderCommand;
 import distr.cli.commands.DumpCommand;
 import distr.cli.commands.GetCommand;
+import distr.cli.commands.GetAllCommand;
 import distr.cli.commands.ListNodesCommand;
 import distr.cli.commands.PutCommand;
 import distr.cli.commands.RemoveNodeCommand;
 import distr.cli.commands.SetLeaderCommand;
+import distr.cli.commands.SetModeCommand;
 import distr.cli.commands.SetReplicationCommand;
 import distr.cli.commands.SetReplicationDelayCommand;
 import distr.cli.commands.SetRfCommand;
 import distr.cli.commands.SetSemiSyncAcksCommand;
+import distr.cli.commands.SetStarCenterCommand;
+import distr.cli.commands.SetTopologyCommand;
 import distr.cli.commands.DeleteCommand;
 import distr.cli.commands.ReplCommand;
 
@@ -29,13 +35,19 @@ import java.nio.file.Path;
                 RemoveNodeCommand.class,
                 ListNodesCommand.class,
                 SetLeaderCommand.class,
+                DemoteLeaderCommand.class,
+                SetModeCommand.class,
+                SetTopologyCommand.class,
+                SetStarCenterCommand.class,
                 SetReplicationCommand.class,
                 SetRfCommand.class,
                 SetSemiSyncAcksCommand.class,
                 SetReplicationDelayCommand.class,
                 PutCommand.class,
                 GetCommand.class,
+                GetAllCommand.class,
                 DumpCommand.class,
+                ClusterDumpCommand.class,
                 DeleteCommand.class,
                 BenchCommand.class,
                 ReplCommand.class

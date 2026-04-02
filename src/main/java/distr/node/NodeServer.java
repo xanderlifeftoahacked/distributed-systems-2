@@ -115,7 +115,11 @@ public final class NodeServer {
     private ObjectNode handleClusterUpdate(ObjectNode request, String requestId) {
         ClusterState incoming = ClusterState.fromJson(request);
         context.clusterState().applyFrom(incoming);
-        LOG.info("Cluster update: leader=" + incoming.getLeaderNodeId() + " rf=" + incoming.getRf() + " mode=" + incoming.getReplicationMode());
+        LOG.info("Cluster update: leaderNodeId=" + incoming.getLeaderNodeId()
+                + " clusterMode=" + incoming.getMode()
+                + " replicationMode=" + incoming.getReplicationMode()
+                + " topology=" + incoming.getTopology()
+                + " rf=" + incoming.getRf());
         return okResponse(requestId);
     }
 
@@ -126,22 +130,17 @@ public final class NodeServer {
             return errorResponse(requestId, Constants.ERROR_BAD_REQUEST, "Invalid key or value");
         }
         ClusterState cluster = context.clusterState();
-        if (!Objects.equals(cluster.getLeaderNodeId(), context.nodeId())) {
-            ObjectNode response = errorResponse(requestId, Constants.ERROR_NOT_LEADER, "Not a leader");
-            if (cluster.getLeaderNodeId() != null) {
-                response.put(Constants.LEADER_ID, cluster.getLeaderNodeId());
-            }
-            LOG.info("Reject PUT key=" + key + " not leader");
-            return response;
-        }
         ReplicationResult result = context.replicationManager().handleClientPut(key, value);
         if (result.isOk()) {
             LOG.info("PUT key=" + key + " ok");
             return okResponse(requestId);
         }
         ObjectNode response = errorResponse(requestId, result.errorCode(), result.errorCode());
-        if (Constants.ERROR_NOT_LEADER.equals(result.errorCode()) && cluster.getLeaderNodeId() != null) {
-            response.put(Constants.LEADER_ID, cluster.getLeaderNodeId());
+        if (Constants.ERROR_NOT_LEADER_FOR_WRITE.equals(result.errorCode()) || Constants.ERROR_NOT_LEADER.equals(result.errorCode())) {
+            String leader = cluster.suggestLeaderNodeId();
+            if (leader != null) {
+                response.put(Constants.LEADER_ID, leader);
+            }
         }
         LOG.info("PUT key=" + key + " error=" + result.errorCode());
         return response;
@@ -153,22 +152,17 @@ public final class NodeServer {
             return errorResponse(requestId, Constants.ERROR_BAD_REQUEST, "Invalid key");
         }
         ClusterState cluster = context.clusterState();
-        if (!Objects.equals(cluster.getLeaderNodeId(), context.nodeId())) {
-            ObjectNode response = errorResponse(requestId, Constants.ERROR_NOT_LEADER, "Not a leader");
-            if (cluster.getLeaderNodeId() != null) {
-                response.put(Constants.LEADER_ID, cluster.getLeaderNodeId());
-            }
-            LOG.info("Reject DELETE key=" + key + " not leader");
-            return response;
-        }
         ReplicationResult result = context.replicationManager().handleClientDelete(key);
         if (result.isOk()) {
             LOG.info("DELETE key=" + key + " ok");
             return okResponse(requestId);
         }
         ObjectNode response = errorResponse(requestId, result.errorCode(), result.errorCode());
-        if (Constants.ERROR_NOT_LEADER.equals(result.errorCode()) && cluster.getLeaderNodeId() != null) {
-            response.put(Constants.LEADER_ID, cluster.getLeaderNodeId());
+        if (Constants.ERROR_NOT_LEADER_FOR_WRITE.equals(result.errorCode()) || Constants.ERROR_NOT_LEADER.equals(result.errorCode())) {
+            String leader = cluster.suggestLeaderNodeId();
+            if (leader != null) {
+                response.put(Constants.LEADER_ID, leader);
+            }
         }
         LOG.info("DELETE key=" + key + " error=" + result.errorCode());
         return response;
@@ -186,17 +180,27 @@ public final class NodeServer {
         } else {
             response.put(Constants.FOUND, true);
             response.put(Constants.VALUE, entry.value());
+            ObjectNode version = response.putObject(Constants.VERSION);
+            version.put(Constants.LAMPORT, entry.lamport());
+            version.put(Constants.NODE_ID, entry.nodeId());
         }
         LOG.fine("GET key=" + key + " found=" + response.path(Constants.FOUND).asBoolean());
         return response;
     }
 
     private ObjectNode handleClientDump(ObjectNode request, String requestId) {
-        Map<String, String> dump = context.store().dump();
+        Map<String, ValueEntry> dump = context.store().dumpWithMetadata();
         ObjectNode response = okResponse(requestId);
         ObjectNode payload = response.putObject(Constants.VALUE);
-        for (Map.Entry<String, String> entry : dump.entrySet()) {
-            payload.put(entry.getKey(), entry.getValue());
+        for (Map.Entry<String, ValueEntry> entry : dump.entrySet()) {
+            if (entry.getValue().tombstone()) {
+                continue;
+            }
+            ObjectNode item = payload.putObject(entry.getKey());
+            item.put(Constants.VALUE, entry.getValue().value());
+            ObjectNode version = item.putObject(Constants.VERSION);
+            version.put(Constants.LAMPORT, entry.getValue().lamport());
+            version.put(Constants.NODE_ID, entry.getValue().nodeId());
         }
         return response;
     }
@@ -212,22 +216,29 @@ public final class NodeServer {
     private ObjectNode handleReplicationApply(ObjectNode request, boolean isPut) {
         String opId = request.path(Constants.OP_ID).asText(null);
         String origin = request.path(Constants.ORIGIN_NODE_ID).asText(null);
+        String source = request.path(Constants.SOURCE_NODE_ID).asText(null);
         String key = request.path(Constants.KEY).asText(null);
-        long seq = request.path(Constants.SEQ).asLong(0L);
+        ObjectNode version = request.has(Constants.VERSION) && request.get(Constants.VERSION).isObject()
+                ? (ObjectNode) request.get(Constants.VERSION)
+                : null;
+        long lamport = version == null ? 0L : version.path(Constants.LAMPORT).asLong(0L);
+        String versionNodeId = version == null ? null : version.path(Constants.NODE_ID).asText(null);
         if (!isValidKey(key) || opId == null || origin == null) {
             return null;
         }
         boolean seen = dedupStore.seenOrAdd(opId);
         if (!seen) {
+            context.observeLamport(lamport);
             delayReplication();
             if (isPut) {
                 String value = request.path(Constants.VALUE).asText(null);
                 if (value != null) {
-                    context.store().applyPut(key, value, seq);
+                    context.store().applyPut(key, value, lamport, versionNodeId);
                 }
             } else {
-                context.store().applyDelete(key, seq);
+                context.store().applyDelete(key, lamport, versionNodeId);
             }
+            context.replicationManager().forward(request, source);
         }
         sendAck(origin, opId);
         if (!seen) {
@@ -295,6 +306,9 @@ public final class NodeServer {
             response.put(Constants.REQUEST_ID, requestId);
         }
         response.put(Constants.STATUS, Constants.STATUS_ERROR);
+        if (Constants.ERROR_NOT_LEADER.equals(code)) {
+            code = Constants.ERROR_NOT_LEADER_FOR_WRITE;
+        }
         response.put(Constants.ERROR_CODE, code);
         response.put(Constants.ERROR_MESSAGE, message);
         return response;

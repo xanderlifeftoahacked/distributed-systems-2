@@ -1,14 +1,12 @@
 package distr.cli.commands;
 
 import distr.cli.CliState;
-import distr.common.NodeInfo;
-import distr.common.NodeRole;
 
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Parameters;
 
-@Command(name = "setLeader")
-public final class SetLeaderCommand extends BaseCommand {
+@Command(name = "setStarCenter")
+public final class SetStarCenterCommand extends BaseCommand {
     @Parameters(index = "0")
     private String nodeId;
 
@@ -19,11 +17,7 @@ public final class SetLeaderCommand extends BaseCommand {
             System.err.println("UNKNOWN_NODE");
             return;
         }
-        state.setLeaderNodeId(nodeId);
-        NodeInfo current = state.getNode(nodeId).orElse(null);
-        if (current != null) {
-            state.upsertNode(new NodeInfo(current.nodeId(), current.host(), current.port(), NodeRole.LEADER));
-        }
+        state.setStarCenterNodeId(nodeId);
         saveState(state);
         broadcastClusterUpdate(state);
         System.out.println("OK");

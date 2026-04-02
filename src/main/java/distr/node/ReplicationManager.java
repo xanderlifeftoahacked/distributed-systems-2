@@ -1,11 +1,13 @@
 package distr.node;
 
+import distr.common.ClusterMode;
 import distr.common.ClusterState;
 import distr.common.Constants;
+import distr.common.JsonUtil;
 import distr.common.NetworkClient;
 import distr.common.NodeInfo;
 import distr.common.ReplicationMode;
-import distr.common.JsonUtil;
+import distr.common.Topology;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
@@ -32,77 +34,67 @@ public final class ReplicationManager {
     }
 
     public ReplicationResult handleClientPut(String key, String value) {
-        long seq = context.nextSeq();
-        context.store().applyPut(key, value, seq);
-        return replicate(Constants.PUT, key, value, seq);
+        ClusterState cluster = context.clusterState();
+        if (!cluster.canAcceptWrite(context.nodeId())) {
+            return ReplicationResult.error(Constants.ERROR_NOT_LEADER_FOR_WRITE);
+        }
+        long lamport = context.nextLamport();
+        context.store().applyPut(key, value, lamport, context.nodeId());
+        return replicate(Constants.REPL_PUT, key, value, lamport, context.nodeId());
     }
 
     public ReplicationResult handleClientDelete(String key) {
-        long seq = context.nextSeq();
-        context.store().applyDelete(key, seq);
-        return replicate(Constants.DELETE, key, null, seq);
-    }
-
-    private ReplicationResult replicate(String opType, String key, String value, long seq) {
         ClusterState cluster = context.clusterState();
-        String leaderId = cluster.getLeaderNodeId();
-        if (leaderId == null || !leaderId.equals(context.nodeId())) {
-            return ReplicationResult.error(Constants.ERROR_NOT_LEADER);
+        if (!cluster.canAcceptWrite(context.nodeId())) {
+            return ReplicationResult.error(Constants.ERROR_NOT_LEADER_FOR_WRITE);
         }
-        int clusterSize = cluster.getNodes().size();
-        int rf = cluster.getRf();
-        if (rf > clusterSize) {
-            return ReplicationResult.error(Constants.ERROR_NOT_ENOUGH_REPLICAS);
-        }
-        int followersRequired = Math.max(0, rf - 1);
-        List<NodeInfo> followers = new ArrayList<>();
-        for (NodeInfo node : cluster.nodesValues()) {
-            if (!node.nodeId().equals(context.nodeId())) {
-                followers.add(node);
-            }
-        }
-        if (followersRequired > followers.size()) {
-            return ReplicationResult.error(Constants.ERROR_NOT_ENOUGH_REPLICAS);
-        }
-        String opId = UUID.randomUUID().toString();
-        OperationState state = new OperationState(opId, opType, key, value, seq, followers);
-        operations.put(opId, state);
-        LOG.info("Replicate opId=" + opId + " type=" + opType + " rf=" + rf + " mode=" + cluster.getReplicationMode());
-        sendReplication(state);
-        ReplicationMode mode = cluster.getReplicationMode();
-        if (mode == ReplicationMode.ASYNC || followersRequired == 0) {
-            return ReplicationResult.ok();
-        }
-        int hotAcks = followersRequired;
-        if (mode == ReplicationMode.SEMI_SYNC) {
-            int k = cluster.getSemiSyncAcks();
-            hotAcks = Math.min(k, followersRequired);
-        }
-        boolean ok = state.waitForAcks(hotAcks, Constants.DEFAULT_TIMEOUT_MS);
-        if (!ok) {
-            LOG.info("Replicate opId=" + opId + " failed requiredAcks=" + hotAcks + " got=" + state.ackedCount());
-        }
-        return ok ? ReplicationResult.ok() : ReplicationResult.error(Constants.ERROR_NOT_ENOUGH_REPLICAS);
+        long lamport = context.nextLamport();
+        context.store().applyDelete(key, lamport, context.nodeId());
+        return replicate(Constants.REPL_DELETE, key, null, lamport, context.nodeId());
     }
 
-    private void sendReplication(OperationState state) {
-        for (NodeInfo node : state.targets()) {
-            ObjectNode req = JsonUtil.object();
-            req.put(Constants.TYPE, state.opType());
-            req.put(Constants.OP_ID, state.opId());
-            req.put(Constants.ORIGIN_NODE_ID, context.nodeId());
-            req.put(Constants.KEY, state.key());
-            req.put(Constants.SEQ, state.seq());
-            if (Constants.PUT.equals(state.opType())) {
-                req.put(Constants.VALUE, state.value());
-                req.put(Constants.OP_TYPE, Constants.PUT);
-                req.put(Constants.TYPE, Constants.REPL_PUT);
-            } else {
-                req.put(Constants.OP_TYPE, Constants.DELETE);
-                req.put(Constants.TYPE, Constants.REPL_DELETE);
+    private ReplicationResult replicate(String replType, String key, String value, long lamport, String versionNodeId) {
+        ClusterState cluster = context.clusterState();
+        List<NodeInfo> targets = initialTargets(cluster, context.nodeId());
+        String opId = UUID.randomUUID().toString();
+        if (cluster.getMode() == ClusterMode.SINGLE) {
+            int rf = cluster.getRf();
+            int clusterSize = cluster.getNodes().size();
+            if (rf > clusterSize) {
+                return ReplicationResult.error(Constants.ERROR_NOT_ENOUGH_REPLICAS);
             }
-            NetworkClient.sendOneWay(node.host(), node.port(), req, Constants.DEFAULT_TIMEOUT_MS);
+            int requiredFollowers = Math.max(0, rf - 1);
+            if (requiredFollowers > targets.size()) {
+                return ReplicationResult.error(Constants.ERROR_NOT_ENOUGH_REPLICAS);
+            }
+            OperationState state = new OperationState(opId, replType, key, value, lamport, versionNodeId, targets);
+            operations.put(opId, state);
+            sendReplication(state, state.targets());
+            ReplicationMode mode = cluster.getReplicationMode();
+            if (mode == ReplicationMode.ASYNC || requiredFollowers == 0) {
+                return ReplicationResult.ok();
+            }
+            int hotAcks = requiredFollowers;
+            if (mode == ReplicationMode.SEMI_SYNC) {
+                hotAcks = Math.min(cluster.getSemiSyncAcks(), requiredFollowers);
+            }
+            boolean ok = state.waitForAcks(hotAcks, Constants.DEFAULT_TIMEOUT_MS);
+            return ok ? ReplicationResult.ok() : ReplicationResult.error(Constants.ERROR_NOT_ENOUGH_REPLICAS);
         }
+        ObjectNode req = buildReplicationRequest(opId, replType, key, value, lamport, versionNodeId, context.nodeId(), context.nodeId());
+        sendToTargets(req, targets);
+        return ReplicationResult.ok();
+    }
+
+    public void forward(ObjectNode inbound, String sourceNodeId) {
+        ClusterState cluster = context.clusterState();
+        List<NodeInfo> targets = forwardTargets(cluster, context.nodeId(), sourceNodeId);
+        if (targets.isEmpty()) {
+            return;
+        }
+        ObjectNode out = inbound.deepCopy();
+        out.put(Constants.SOURCE_NODE_ID, context.nodeId());
+        sendToTargets(out, targets);
     }
 
     public void onAck(String opId, String fromNodeId) {
@@ -114,24 +106,126 @@ public final class ReplicationManager {
         LOG.fine("ACK opId=" + opId + " from=" + fromNodeId + " count=" + state.ackedCount());
     }
 
+    private void sendReplication(OperationState state, List<NodeInfo> targets) {
+        ObjectNode req = buildReplicationRequest(
+                state.opId(),
+                state.replType(),
+                state.key(),
+                state.value(),
+                state.lamport(),
+                state.versionNodeId(),
+                context.nodeId(),
+                context.nodeId()
+        );
+        sendToTargets(req, targets);
+    }
+
+    private ObjectNode buildReplicationRequest(
+            String opId,
+            String replType,
+            String key,
+            String value,
+            long lamport,
+            String versionNodeId,
+            String originNodeId,
+            String sourceNodeId
+    ) {
+        ObjectNode req = JsonUtil.object();
+        req.put(Constants.TYPE, replType);
+        req.put(Constants.OP_ID, opId);
+        req.put(Constants.ORIGIN_NODE_ID, originNodeId);
+        req.put(Constants.SOURCE_NODE_ID, sourceNodeId);
+        req.put(Constants.KEY, key);
+        ObjectNode version = req.putObject(Constants.VERSION);
+        version.put(Constants.LAMPORT, lamport);
+        version.put(Constants.NODE_ID, versionNodeId);
+        if (Constants.REPL_PUT.equals(replType) && value != null) {
+            req.put(Constants.VALUE, value);
+        }
+        return req;
+    }
+
+    private void sendToTargets(ObjectNode req, List<NodeInfo> targets) {
+        for (NodeInfo node : targets) {
+            NetworkClient.sendOneWay(node.host(), node.port(), req, Constants.DEFAULT_TIMEOUT_MS);
+        }
+    }
+
+    private List<NodeInfo> initialTargets(ClusterState cluster, String selfNodeId) {
+        if (cluster.getMode() == ClusterMode.SINGLE) {
+            List<NodeInfo> out = new ArrayList<>();
+            for (NodeInfo node : cluster.nodesValues()) {
+                if (!selfNodeId.equals(node.nodeId())) {
+                    out.add(node);
+                }
+            }
+            return out;
+        }
+        return forwardTargets(cluster, selfNodeId, selfNodeId);
+    }
+
+    private List<NodeInfo> forwardTargets(ClusterState cluster, String selfNodeId, String sourceNodeId) {
+        Topology topology = cluster.getTopology();
+        if (topology == null) {
+            topology = Topology.MESH;
+        }
+        return switch (topology) {
+            case MESH -> meshTargets(cluster, selfNodeId, sourceNodeId);
+            case RING -> ringTargets(cluster, selfNodeId, sourceNodeId);
+            case STAR -> starTargets(cluster, selfNodeId, sourceNodeId);
+        };
+    }
+
+    private List<NodeInfo> meshTargets(ClusterState cluster, String selfNodeId, String sourceNodeId) {
+        List<NodeInfo> out = new ArrayList<>();
+        for (NodeInfo node : cluster.nodesValues()) {
+            if (selfNodeId.equals(node.nodeId())) {
+                continue;
+            }
+            if (sourceNodeId != null && sourceNodeId.equals(node.nodeId())) {
+                continue;
+            }
+            out.add(node);
+        }
+        return out;
+    }
+
+    private List<NodeInfo> ringTargets(ClusterState cluster, String selfNodeId, String sourceNodeId) {
+        NodeInfo next = cluster.ringNext(selfNodeId).orElse(null);
+        if (next == null) {
+            return List.of();
+        }
+        if (sourceNodeId != null && sourceNodeId.equals(next.nodeId())) {
+            return List.of();
+        }
+        return List.of(next);
+    }
+
+    private List<NodeInfo> starTargets(ClusterState cluster, String selfNodeId, String sourceNodeId) {
+        String center = cluster.getStarCenterNodeId();
+        if (center == null) {
+            return meshTargets(cluster, selfNodeId, sourceNodeId);
+        }
+        if (selfNodeId.equals(center)) {
+            return meshTargets(cluster, selfNodeId, sourceNodeId);
+        }
+        if (sourceNodeId != null && sourceNodeId.equals(center)) {
+            return List.of();
+        }
+        NodeInfo node = cluster.getNode(center).orElse(null);
+        if (node == null) {
+            return List.of();
+        }
+        return List.of(node);
+    }
+
     private void retryPending() {
         for (OperationState state : operations.values()) {
-            for (NodeInfo node : state.unackedTargets()) {
-                ObjectNode req = JsonUtil.object();
-                req.put(Constants.OP_ID, state.opId());
-                req.put(Constants.ORIGIN_NODE_ID, context.nodeId());
-                req.put(Constants.KEY, state.key());
-                req.put(Constants.SEQ, state.seq());
-                if (Constants.PUT.equals(state.opType())) {
-                    req.put(Constants.VALUE, state.value());
-                    req.put(Constants.OP_TYPE, Constants.PUT);
-                    req.put(Constants.TYPE, Constants.REPL_PUT);
-                } else {
-                    req.put(Constants.OP_TYPE, Constants.DELETE);
-                    req.put(Constants.TYPE, Constants.REPL_DELETE);
-                }
-                NetworkClient.sendOneWay(node.host(), node.port(), req, Constants.DEFAULT_TIMEOUT_MS);
+            List<NodeInfo> targets = state.unackedTargets();
+            if (targets.isEmpty()) {
+                continue;
             }
+            sendReplication(state, targets);
         }
     }
 
@@ -142,20 +236,22 @@ public final class ReplicationManager {
 
     private static final class OperationState {
         private final String opId;
-        private final String opType;
+        private final String replType;
         private final String key;
         private final String value;
-        private final long seq;
+        private final long lamport;
+        private final String versionNodeId;
         private final long createdAt;
         private final List<NodeInfo> targets;
         private final Set<String> acked = ConcurrentHashMap.newKeySet();
 
-        private OperationState(String opId, String opType, String key, String value, long seq, List<NodeInfo> targets) {
+        private OperationState(String opId, String replType, String key, String value, long lamport, String versionNodeId, List<NodeInfo> targets) {
             this.opId = opId;
-            this.opType = opType;
+            this.replType = replType;
             this.key = key;
             this.value = value;
-            this.seq = seq;
+            this.lamport = lamport;
+            this.versionNodeId = versionNodeId;
             this.targets = targets;
             this.createdAt = System.currentTimeMillis();
         }
@@ -164,8 +260,8 @@ public final class ReplicationManager {
             return opId;
         }
 
-        public String opType() {
-            return opType;
+        public String replType() {
+            return replType;
         }
 
         public String key() {
@@ -176,8 +272,12 @@ public final class ReplicationManager {
             return value;
         }
 
-        public long seq() {
-            return seq;
+        public long lamport() {
+            return lamport;
+        }
+
+        public String versionNodeId() {
+            return versionNodeId;
         }
 
         public long createdAt() {
